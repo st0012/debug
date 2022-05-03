@@ -810,8 +810,9 @@ module DEBUGGER__
             end
 
           when :next
-            frame = @target_frames.first
+            frame = get_frame(@current_frame_index)
             path = frame.location.absolute_path || "!eval:#{frame.path}"
+            depth = frame.frame_depth
             line = frame.location.lineno
 
             if frame.iseq
@@ -821,8 +822,6 @@ module DEBUGGER__
                 next_line = last_line
               end
             end
-
-            depth = @target_frames.first.frame_depth
 
             step_tp iter do
               loc = caller_locations(2, 1).first
