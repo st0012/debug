@@ -178,7 +178,7 @@ module DEBUGGER__
             command: "disconnect",
             arguments: {
               restart: true,
-              terminateDebuggee: true
+              terminateDebuggee: false
             },
             type: "request"
           },

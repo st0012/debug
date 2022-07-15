@@ -43,6 +43,7 @@ end
 desc "Run all debugger protocols (CAP & DAP) related tests"
 Rake::TestTask.new(:test_protocol) do |t|
   t.test_files = FileList["test/protocol/*_test.rb"]
+  t.options = "-v"
 end
 
 task test: 'test_console' do

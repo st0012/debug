@@ -20,6 +20,11 @@ module DEBUGGER__
 
     MULTITHREADED_TEST = !(%w[1 true].include? ENV['RUBY_DEBUG_TEST_DISABLE_THREADS'])
 
+    RUBY = ENV['RUBY'] || RbConfig.ruby
+    RDBG_EXECUTABLE = "#{RUBY} #{__dir__}/../../exe/rdbg"
+
+    TIMEOUT_SEC = (ENV['RUBY_DEBUG_TIMEOUT_SEC'] || 10).to_i
+
     include AssertionHelpers
 
     def setup
@@ -87,16 +92,9 @@ module DEBUGGER__
       Thread.current[:is_subthread]
     end
 
-    ASK_CMD = %w[quit q delete del kill undisplay].freeze
-
     def debug_print msg
       print msg if ENV['RUBY_DEBUG_TEST_DEBUG_MODE']
     end
-
-    RUBY = ENV['RUBY'] || RbConfig.ruby
-    RDBG_EXECUTABLE = "#{RUBY} #{__dir__}/../../exe/rdbg"
-
-    TIMEOUT_SEC = (ENV['RUBY_DEBUG_TIMEOUT_SEC'] || 10).to_i
 
     private
 
