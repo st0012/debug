@@ -5,6 +5,8 @@ module DEBUGGER__
     nr = ENV['RUBY_DEBUG_TEST_NO_REMOTE']
     NO_REMOTE = nr == 'true' || nr == '1'
 
+    ASK_CMD = %w[quit q delete del kill undisplay].freeze
+
     if !NO_REMOTE
       warn "Tests on local and remote. You can disable remote tests with RUBY_DEBUG_TEST_NO_REMOTE=1."
     end
