@@ -2403,7 +2403,9 @@ end
 
 module Kernel
   def debugger pre: nil, do: nil, up_level: 0
-    return if !defined?(::DEBUGGER__::SESSION) || !::DEBUGGER__::SESSION.active?
+    if !defined?(::DEBUGGER__::SESSION) || !::DEBUGGER__::SESSION.active?
+      DEBUGGER__::start no_sigint_hook: true, nonstop: true
+    end
 
     if pre || (do_expr = binding.local_variable_get(:do))
       cmds = ['binding.break', pre, do_expr]
