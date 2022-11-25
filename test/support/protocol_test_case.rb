@@ -50,6 +50,57 @@ module DEBUGGER__
       end
     end
 
+    def attach_to_dap_server
+      @sock = Socket.unix @remote_info.sock_path
+      @seq = 1
+      @reader_thread = Thread.new do
+        while res = recv_response
+          @queue.push res
+        end
+      rescue Detach
+      end
+      sleep 0.001 while @reader_thread.status != 'sleep'
+      @reader_thread.run
+      INITIALIZE_DAP_MSGS.each{|msg| send(**msg)}
+    end
+
+    def attach_to_cdp_server
+      body = get_request HOST, @remote_info.port, '/json'
+      Timeout.timeout(TIMEOUT_SEC) do
+        sleep 0.001 until @remote_info.debuggee_backlog.join.include? 'Disconnected.'
+      end
+
+      sock = Socket.tcp HOST, @remote_info.port
+      uuid = body[0][:id]
+
+      Timeout.timeout(TIMEOUT_SEC) do
+        sleep 0.001 until @remote_info.debuggee_backlog.join.match?(/Disconnected\.\R.*Connected/)
+      end
+
+      @web_sock = WebSocketClient.new sock
+      @web_sock.handshake @remote_info.port, uuid
+      @id = 1
+      @reader_thread = Thread.new do
+        while res = @web_sock.extract_data
+          @queue.push res
+        end
+      rescue Detach
+      end
+      sleep 0.001 while @reader_thread.status != 'sleep'
+      @reader_thread.run
+      INITIALIZE_CDP_MSGS.each{|msg| send(**msg)}
+    end
+
+    def req_dap_disconnect(terminate_debuggee:)
+      send_dap_request 'disconnect', restart: false, terminateDebuggee: terminate_debuggee
+      close_reader
+    end
+
+    def req_cdp_disconnect
+      @web_sock.send_close_connection
+      close_reader
+    end
+
     def req_add_breakpoint lineno, path: temp_file_path, cond: nil
       case get_target_ui
       when 'vscode'
@@ -153,20 +204,6 @@ module DEBUGGER__
       end
 
       close_reader
-    end
-
-    def assert_reattach
-      case get_target_ui
-      when 'vscode'
-        req_disconnect
-        attach_to_dap_server
-        res = find_crt_dap_response
-        result_cmd = res.dig(:command)
-        assert_equal 'configurationDone', result_cmd
-      when 'chrome'
-        req_disconnect
-        attach_to_cdp_server
-      end
     end
 
     def assert_locals_result expected, frame_idx: 0
@@ -282,7 +319,10 @@ module DEBUGGER__
     def execute_dap_scenario scenario
       ENV['RUBY_DEBUG_TEST_UI'] = 'vscode'
 
-      @remote_info = setup_unix_domain_socket_remote_debuggee
+      # TestInfo is defined to use kill_remote_debuggee method.
+      test_info = TestInfo.new
+
+      @remote_info = test_info.remote_info = setup_unix_domain_socket_remote_debuggee
       Timeout.timeout(TIMEOUT_SEC) do
         sleep 0.001 until @remote_info.debuggee_backlog.join.include? 'connection...'
       end
@@ -294,20 +334,23 @@ module DEBUGGER__
 
       attach_to_dap_server
       scenario.call
-
-      flunk create_protocol_message "Expected the debuggee program to finish" unless wait_pid @remote_info.pid, TIMEOUT_SEC
     ensure
       @reader_thread&.kill
       @sock&.close
-      @remote_info&.reader_thread&.kill
-      @remote_info&.r&.close
-      @remote_info&.w&.close
+      kill_remote_debuggee test_info
+      if name = test_info.failed_process
+        flunk create_protocol_message "Expected the debuggee program to finish"
+      end
     end
 
-    def execute_cdp_scenario scenario
+    def execute_cdp_scenario_ scenario
       ENV['RUBY_DEBUG_TEST_UI'] = 'chrome'
 
-      @remote_info = setup_tcpip_remote_debuggee
+      # TestInfo is defined to use kill_remote_debuggee method.
+      test_info = TestInfo.new
+
+      @web_sock = nil
+      @remote_info = test_info.remote_info = setup_tcpip_remote_debuggee
       Timeout.timeout(TIMEOUT_SEC) do
         sleep 0.001 until @remote_info.debuggee_backlog.join.include? @remote_info.port.to_s
       end
@@ -318,15 +361,33 @@ module DEBUGGER__
       @backlog = []
 
       attach_to_cdp_server
+      res = find_response :method, 'Debugger.paused', 'C<D'
+      @crt_frames = res.dig(:params, :callFrames)
       scenario.call
-
-      flunk create_protocol_message "Expected the debuggee program to finish" unless wait_pid @remote_info.pid, TIMEOUT_SEC
     ensure
       @reader_thread&.kill
       @web_sock&.close
-      @remote_info&.reader_thread&.kill
-      @remote_info&.r&.close
-      @remote_info&.w&.close
+      kill_remote_debuggee test_info
+      if name = test_info.failed_process
+        flunk create_protocol_message "Expected the debuggee program to finish"
+      end
+    end
+
+    def execute_cdp_scenario scenario
+      retry_cnt = 0
+      begin
+        execute_cdp_scenario_ scenario
+      rescue Errno::ECONNREFUSED
+        if (retry_cnt += 1) > 10
+          STDERR.puts "retry #{retry_cnt} but can not connect!"
+          raise
+        end
+
+        STDERR.puts "retry (#{retry_cnt}) connecting..."
+
+        sleep 0.3
+        retry
+      end
     end
 
     def req_disconnect
@@ -377,44 +438,7 @@ module DEBUGGER__
       end
     end
 
-    def attach_to_dap_server
-      @sock = Socket.unix @remote_info.sock_path
-      @seq = 1
-      @reader_thread = Thread.new do
-        while res = recv_response
-          @queue.push res
-        end
-      rescue Detach
-      end
-      sleep 0.001 while @reader_thread.status != 'sleep'
-      @reader_thread.run
-      INITIALIZE_DAP_MSGS.each{|msg| send(**msg)}
-    end
-
     HOST = '127.0.0.1'
-
-    def attach_to_cdp_server
-      sock = Socket.tcp HOST, @remote_info.port
-
-      Timeout.timeout(TIMEOUT_SEC) do
-        sleep 0.001 until @remote_info.debuggee_backlog.join.include? 'Connected'
-      end
-
-      @web_sock = WebSocketClient.new sock
-      @web_sock.handshake @remote_info.port, '/'
-      @id = 1
-      @reader_thread = Thread.new do
-        while res = @web_sock.extract_data
-          @queue.push res
-        end
-      rescue Detach
-      end
-      sleep 0.001 while @reader_thread.status != 'sleep'
-      @reader_thread.run
-      INITIALIZE_CDP_MSGS.each{|msg| send(**msg)}
-      res = find_response :method, 'Debugger.paused', 'C<D'
-      @crt_frames = res.dig(:params, :callFrames)
-    end
 
     JAVASCRIPT_TYPE_TO_CLASS_MAPS = {
       'string' => String,
@@ -797,9 +821,9 @@ module DEBUGGER__
       @sock = s
     end
 
-    def handshake port, path
+    def handshake port, uuid
       key = SecureRandom.hex(11)
-      @sock.print "GET #{path} HTTP/1.1\r\nHost: 127.0.0.1:#{port}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: #{key}==\r\n\r\n"
+      @sock.print "GET /#{uuid} HTTP/1.1\r\nHost: 127.0.0.1:#{port}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: #{key}==\r\n\r\n"
       server_key = get_server_key
 
       correct_key = Base64.strict_encode64 Digest::SHA1.digest "#{key}==258EAFA5-E914-47DA-95CA-C5AB0DC85B11"

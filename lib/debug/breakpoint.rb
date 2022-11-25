@@ -6,7 +6,7 @@ module DEBUGGER__
   class Breakpoint
     include SkipPathHelper
 
-    attr_reader :key
+    attr_reader :key, :skip_src
 
     def initialize cond, command, path, do_enable: true
       @deleted = false
@@ -101,6 +101,10 @@ module DEBUGGER__
     def generate_label(name)
       colorize(" BP - #{name} ", [:YELLOW, :BOLD, :REVERSE])
     end
+
+    def pending_until_load?
+      false
+    end
   end
 
   if RUBY_VERSION.to_f <= 2.7
@@ -141,10 +145,11 @@ module DEBUGGER__
       nbp
     end
 
-    def initialize path, line, cond: nil, oneshot: false, hook_call: true, command: nil, skip_activate: false
+    def initialize path, line, cond: nil, oneshot: false, hook_call: true, command: nil, skip_activate: false, skip_src: false
       @line = line
       @oneshot = oneshot
       @hook_call = hook_call
+      @skip_src = skip_src
       @pending = false
 
       @iseq = nil
@@ -156,6 +161,10 @@ module DEBUGGER__
 
       try_activate unless skip_activate
       @pending = !@iseq
+    end
+
+    def pending_until_load?
+      @pending
     end
 
     def setup
@@ -196,7 +205,7 @@ module DEBUGGER__
       enable
 
       if @pending && !@oneshot
-        DEBUGGER__.warn "#{self} is activated."
+        DEBUGGER__.info "#{self} is activated."
       end
     end
 
@@ -500,7 +509,7 @@ module DEBUGGER__
         retried = false
 
         @tp.enable(target: @method)
-        DEBUGGER__.warn "#{self} is activated." if added
+        DEBUGGER__.info "#{self} is activated." if added
 
         if @sig_op == '#'
           @cond_class = @klass if @method.owner != @klass

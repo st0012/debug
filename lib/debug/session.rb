@@ -85,11 +85,13 @@ class RubyVM::InstructionSequence
 end
 
 module DEBUGGER__
-  PresetCommand = Struct.new(:commands, :source, :auto_continue)
+  PresetCommands = Struct.new(:commands, :source, :auto_continue)
+  SessionCommand = Struct.new(:block, :repeat, :unsafe, :cancel_auto_continue, :postmortem)
+
   class PostmortemError < RuntimeError; end
 
   class Session
-    attr_reader :intercepted_sigint_cmd, :process_group
+    attr_reader :intercepted_sigint_cmd, :process_group, :subsession_id
 
     include Color
 
@@ -116,6 +118,7 @@ module DEBUGGER__
       @intercepted_sigint_cmd = 'DEFAULT'
       @process_group = ProcessGroup.new
       @subsession_stack = []
+      @subsession_id = 0
 
       @frame_map = {} # for DAP: {id => [threadId, frame_depth]} and CDP: {id => frame_depth}
       @var_map   = {1 => [:globals], } # {id => ...} for DAP
@@ -125,21 +128,36 @@ module DEBUGGER__
       @obj_map = {} # { object_id => ... } for CDP
 
       @tp_thread_begin = nil
+      @commands = {}
+      @unsafe_context = false
+
+      has_keep_script_lines = RubyVM.respond_to? :keep_script_lines
+
       @tp_load_script = TracePoint.new(:script_compiled){|tp|
-        ThreadClient.current.on_load tp.instruction_sequence, tp.eval_script
+        if !has_keep_script_lines || bps_pending_until_load?
+          ThreadClient.current.on_load tp.instruction_sequence, tp.eval_script
+        end
       }
       @tp_load_script.enable
 
       @thread_stopper = thread_stopper
       self.postmortem = CONFIG[:postmortem]
+
+      register_default_command
     end
 
     def active?
       !@q_evt.closed?
     end
 
-    def break_at? file, line
-      @bps.has_key? [file, line]
+    def stop_stepping? file, line, subsession_id
+      if @bps.has_key? [file, line]
+        true
+      elsif @subsession_id != subsession_id
+        true
+      else
+        false
+      end
     end
 
     def activate ui = nil, on_fork: false
@@ -193,6 +211,14 @@ module DEBUGGER__
     def reset_ui ui
       @ui.deactivate
       @ui = ui
+
+      # activate new ui
+      @tp_thread_begin.disable
+      @ui.activate self
+      if @ui.respond_to?(:reader_thread) && thc = get_thread_client(@ui.reader_thread)
+        thc.mark_as_management
+      end
+      @tp_thread_begin.enable
     end
 
     def pop_event
@@ -323,7 +349,7 @@ module DEBUGGER__
       if @preset_command && !@preset_command.commands.empty?
         @preset_command.commands += cs
       else
-        @preset_command = PresetCommand.new(cs, name, continue)
+        @preset_command = PresetCommands.new(cs, name, continue)
       end
 
       ThreadClient.current.on_init name if kick
@@ -396,97 +422,121 @@ module DEBUGGER__
       end
     end
 
-    def process_command line
-      if line.empty?
-        if @repl_prev_line
-          line = @repl_prev_line
-        else
-          return :retry
-        end
-      else
-        @repl_prev_line = line
-      end
+    private def register_command *names,
+                                 repeat: false, unsafe: true, cancel_auto_continue: false, postmortem: true,
+                                 &b
+      cmd = SessionCommand.new(b, repeat, unsafe, cancel_auto_continue, postmortem)
 
-      /([^\s]+)(?:\s+(.+))?/ =~ line
-      cmd, arg = $1, $2
+      names.each{|name|
+        @commands[name] = cmd
+      }
+    end
 
-      # p cmd: [cmd, *arg]
-
-      case cmd
+    def register_default_command
       ### Control flow
 
       # * `s[tep]`
       #   * Step in. Resume the program until next breakable point.
       # * `s[tep] <n>`
       #   * Step in, resume the program at `<n>`th breakable point.
-      when 's', 'step'
-        cancel_auto_continue
-        check_postmortem
+      register_command 's', 'step',
+                       repeat: true,
+                       cancel_auto_continue: true,
+                       postmortem: false do |arg|
         step_command :in, arg
+      end
 
       # * `n[ext]`
       #   * Step over. Resume the program until next line.
       # * `n[ext] <n>`
       #   * Step over, same as `step <n>`.
-      when 'n', 'next'
-        cancel_auto_continue
-        check_postmortem
+      register_command 'n', 'next',
+                       repeat: true,
+                       cancel_auto_continue: true,
+                       postmortem: false do |arg|
         step_command :next, arg
+      end
 
       # * `fin[ish]`
       #   * Finish this frame. Resume the program until the current frame is finished.
       # * `fin[ish] <n>`
       #   * Finish `<n>`th frames.
-      when 'fin', 'finish'
-        cancel_auto_continue
-        check_postmortem
-
+      register_command 'fin', 'finish',
+                       repeat: true,
+                       cancel_auto_continue: true,
+                       postmortem: false do |arg|
         if arg&.to_i == 0
           raise 'finish command with 0 does not make sense.'
         end
 
         step_command :finish, arg
+      end
 
-      # * `c[ontinue]`
+      # * `u[ntil]`
+      #   * Similar to `next` command, but only stop later lines or the end of the current frame.
+      #   * Similar to gdb's `advance` command.
+      # * `u[ntil] <[file:]line>
+      #   * Run til the program reaches given location or the end of the current frame.
+      # * `u[ntil] <name>
+      #   * Run til the program invokes a method `<name>`. `<name>` can be a regexp with `/name/`.
+      register_command 'u', 'until',
+                       repeat: true,
+                       cancel_auto_continue: true,
+                       postmortem: false do |arg|
+
+        step_command :until, arg
+      end
+
+      # * `c` or `cont` or `continue`
       #   * Resume the program.
-      when 'c', 'continue'
-        cancel_auto_continue
+      register_command 'c', 'cont', 'continue',
+                       repeat: true,
+                       cancel_auto_continue: true do |arg|
         leave_subsession :continue
+      end
 
       # * `q[uit]` or `Ctrl-D`
       #   * Finish debugger (with the debuggee process on non-remote debugging).
-      when 'q', 'quit'
+      register_command 'q', 'quit' do |arg|
         if ask 'Really quit?'
-          @ui.quit arg.to_i
+          @ui.quit arg.to_i do
+            request_tc :quit
+          end
           leave_subsession :continue
         else
-          return :retry
+          next :retry
         end
+      end
 
       # * `q[uit]!`
       #   * Same as q[uit] but without the confirmation prompt.
-      when 'q!', 'quit!'
-        @ui.quit arg.to_i
-        leave_subsession nil
+      register_command 'q!', 'quit!', unsafe: false do |arg|
+        @ui.quit arg.to_i do
+          request_tc :quit
+        end
+        leave_subsession :continue
+      end
 
       # * `kill`
       #   * Stop the debuggee process with `Kernel#exit!`.
-      when 'kill'
+      register_command 'kill' do |arg|
         if ask 'Really kill?'
           exit! (arg || 1).to_i
         else
-          return :retry
+          next :retry
         end
+      end
 
       # * `kill!`
       #   * Same as kill but without the confirmation prompt.
-      when 'kill!'
+      register_command 'kill!', unsafe: false do |arg|
         exit! (arg || 1).to_i
+      end
 
       # * `sigint`
       #   * Execute SIGINT handler registered by the debuggee.
       #   * Note that this command should be used just after stop by `SIGINT`.
-      when 'sigint'
+      register_command 'sigint' do
         begin
           case cmd = @intercepted_sigint_cmd
           when nil, 'IGNORE', :IGNORE, 'DEFAULT', :DEFAULT
@@ -502,8 +552,9 @@ module DEBUGGER__
         rescue Exception => e
           @ui.puts "Exception: #{e}"
           @ui.puts e.backtrace.map{|line| "  #{e}"}
-          return :retry
+          next :retry
         end
+      end
 
       ### Breakpoint
 
@@ -528,22 +579,21 @@ module DEBUGGER__
       # * `b[reak] if: <expr>`
       #   * break if: `<expr>` is true at any lines.
       #   * Note that this feature is super slow.
-      when 'b', 'break'
-        check_postmortem
-
+      register_command 'b', 'break', postmortem: false, unsafe: false do |arg|
         if arg == nil
           show_bps
-          return :retry
+          next :retry
         else
           case bp = repl_add_breakpoint(arg)
           when :noretry
           when nil
-            return :retry
+            next :retry
           else
             show_bps bp
-            return :retry
+            next :retry
           end
         end
+      end
 
       # * `catch <Error>`
       #   * Set breakpoint on raising `<Error>`.
@@ -555,16 +605,16 @@ module DEBUGGER__
       #   * stops and run `<command>`, and continue.
       # * `catch ... path: <path>`
       #   * stops if the exception is raised from a `<path>`. `<path>` can be a regexp with `/regexp/`.
-      when 'catch'
-        check_postmortem
-
+      register_command 'catch', postmortem: false, unsafe: false do |arg|
         if arg
           bp = repl_add_catch_breakpoint arg
           show_bps bp if bp
         else
           show_bps
         end
-        return :retry
+
+        :retry
+      end
 
       # * `watch @ivar`
       #   * Stop the execution when the result of current scope's `@ivar` is changed.
@@ -577,24 +627,20 @@ module DEBUGGER__
       #   * stops and run `<command>`, and continue.
       # * `watch ... path: <path>`
       #   * stops if the path matches `<path>`. `<path>` can be a regexp with `/regexp/`.
-      when 'wat', 'watch'
-        check_postmortem
-
+      register_command 'wat', 'watch', postmortem: false, unsafe: false do |arg|
         if arg && arg.match?(/\A@\w+/)
           repl_add_watch_breakpoint(arg)
         else
           show_bps
-          return :retry
+          :retry
         end
+      end
 
       # * `del[ete]`
       #   * delete all breakpoints.
       # * `del[ete] <bpnum>`
       #   * delete specified breakpoint.
-      when 'del', 'delete'
-        check_postmortem
-
-        bp =
+      register_command 'del', 'delete', postmortem: false, unsafe: false do |arg|
         case arg
         when nil
           show_bps
@@ -602,12 +648,13 @@ module DEBUGGER__
             delete_bp
           end
         when /\d+/
-          delete_bp arg.to_i
+          bp = delete_bp arg.to_i
         else
           nil
         end
         @ui.puts "deleted: \##{bp[0]} #{bp[1]}" if bp
-        return :retry
+        :retry
+      end
 
       ### Information
 
@@ -619,7 +666,7 @@ module DEBUGGER__
       #   * Only shows frames with method name or location info that matches `/regexp/`.
       # * `bt <num> /regexp/` or `backtrace <num> /regexp/`
       #   * Only shows first `<num>` frames with method name or location info that matches `/regexp/`.
-      when 'bt', 'backtrace'
+      register_command 'bt', 'backtrace', unsafe: false do |arg|
         case arg
         when /\A(\d+)\z/
           request_tc [:show, :backtrace, arg.to_i, nil]
@@ -632,6 +679,7 @@ module DEBUGGER__
         else
           request_tc [:show, :backtrace, nil, nil]
         end
+      end
 
       # * `l[ist]`
       #   * Show current frame's source code.
@@ -640,7 +688,7 @@ module DEBUGGER__
       #   * Show predecessor lines as opposed to the `list` command.
       # * `l[ist] <start>` or `l[ist] <start>-<end>`
       #   * Show current frame's source code from the line <start> to <end> if given.
-      when 'l', 'list'
+      register_command 'l', 'list', repeat: true, unsafe: false do |arg|
         case arg ? arg.strip : nil
         when /\A(\d+)\z/
           request_tc [:show, :list, {start_line: arg.to_i - 1}]
@@ -652,33 +700,36 @@ module DEBUGGER__
           request_tc [:show, :list]
         else
           @ui.puts "Can not handle list argument: #{arg}"
-          return :retry
+          :retry
         end
+      end
 
       # * `whereami`
       #   * Show the current frame with source code.
-      when 'whereami'
+      register_command 'whereami', unsafe: false do
         request_tc [:show, :whereami]
+      end
 
       # * `edit`
       #   * Open the current file on the editor (use `EDITOR` environment variable).
       #   * Note that edited file will not be reloaded.
       # * `edit <file>`
       #   * Open <file> on the editor.
-      when 'edit'
+      register_command 'edit' do |arg|
         if @ui.remote?
           @ui.puts "not supported on the remote console."
-          return :retry
+          next :retry
         end
 
         begin
           arg = resolve_path(arg) if arg
         rescue Errno::ENOENT
           @ui.puts "not found: #{arg}"
-          return :retry
+          next :retry
         end
 
         request_tc [:show, :edit, arg]
+      end
 
       # * `i[nfo]`
       #    * Show information about current frame (local/instance variables and defined constants).
@@ -695,7 +746,7 @@ module DEBUGGER__
       #   * Filter the output with `/regexp/`.
       # * `i[nfo] th[read[s]]`
       #   * Show all threads (same as `th[read]`).
-      when 'i', 'info'
+      register_command 'i', 'info', unsafe: false do |arg|
         if /\/(.+)\/\z/ =~ arg
           pat = Regexp.compile($1)
           sub = $~.pre_match.strip
@@ -716,38 +767,41 @@ module DEBUGGER__
           request_tc [:show, :globals, pat]
         when 'th', /threads?/
           thread_list
-          return :retry
+          :retry
         else
           @ui.puts "unrecognized argument for info command: #{arg}"
           show_help 'info'
-          return :retry
+          :retry
         end
+      end
 
       # * `o[utline]` or `ls`
       #   * Show you available methods, constants, local variables, and instance variables in the current scope.
       # * `o[utline] <expr>` or `ls <expr>`
       #   * Show you available methods and instance variables of the given object.
       #   * If the object is a class/module, it also lists its constants.
-      when 'outline', 'o', 'ls'
+      register_command 'outline', 'o', 'ls', unsafe: false do |arg|
         request_tc [:show, :outline, arg]
+      end
 
       # * `display`
       #   * Show display setting.
       # * `display <expr>`
       #   * Show the result of `<expr>` at every suspended timing.
-      when 'display'
+      register_command 'display', postmortem: false do |arg|
         if arg && !arg.empty?
           @displays << arg
           request_tc [:eval, :try_display, @displays]
         else
           request_tc [:eval, :display, @displays]
         end
+      end
 
       # * `undisplay`
       #   * Remove all display settings.
       # * `undisplay <displaynum>`
       #   * Remove a specified display setting.
-      when 'undisplay'
+      register_command 'undisplay', postmortem: false, unsafe: false do |arg|
         case arg
         when /(\d+)/
           if @displays[n = $1.to_i]
@@ -758,8 +812,9 @@ module DEBUGGER__
           if ask "clear all?", 'N'
             @displays.clear
           end
-          return :retry
+          :retry
         end
+      end
 
       ### Frame control
 
@@ -767,53 +822,57 @@ module DEBUGGER__
       #   * Show the current frame.
       # * `f[rame] <framenum>`
       #   * Specify a current frame. Evaluation are run on specified frame.
-      when 'frame', 'f'
+      register_command 'frame', 'f', unsafe: false do |arg|
         request_tc [:frame, :set, arg]
+      end
 
       # * `up`
       #   * Specify the upper frame.
-      when 'up'
+      register_command 'up', repeat: true, unsafe: false do |arg|
         request_tc [:frame, :up]
+      end
 
       # * `down`
       #   * Specify the lower frame.
-      when 'down'
+      register_command 'down', repeat: true, unsafe: false do |arg|
         request_tc [:frame, :down]
+      end
 
       ### Evaluate
 
       # * `p <expr>`
       #   * Evaluate like `p <expr>` on the current frame.
-      when 'p'
+      register_command 'p' do |arg|
         request_tc [:eval, :p, arg.to_s]
+      end
 
       # * `pp <expr>`
       #   * Evaluate like `pp <expr>` on the current frame.
-      when 'pp'
+      register_command 'pp' do |arg|
         request_tc [:eval, :pp, arg.to_s]
+      end
 
       # * `eval <expr>`
       #   * Evaluate `<expr>` on the current frame.
-      when 'eval', 'call'
+      register_command 'eval', 'call' do |arg|
         if arg == nil || arg.empty?
           show_help 'eval'
           @ui.puts "\nTo evaluate the variable `#{cmd}`, use `pp #{cmd}` instead."
-          return :retry
+          :retry
         else
           request_tc [:eval, :call, arg]
         end
+      end
 
       # * `irb`
       #   * Invoke `irb` on the current frame.
-      when 'irb'
+      register_command 'irb' do |arg|
         if @ui.remote?
           @ui.puts "not supported on the remote console."
-          return :retry
+          :retry
         end
         request_tc [:eval, :irb]
-
-        # don't repeat irb command
-        @repl_prev_line = nil
+      end
 
       ### Trace
       # * `trace`
@@ -834,7 +893,7 @@ module DEBUGGER__
       #   * Disable tracer specified by `<num>` (use `trace` command to check the numbers).
       # * `trace off [line|call|pass]`
       #   * Disable all tracers. If `<type>` is provided, disable specified type tracers.
-      when 'trace'
+      register_command 'trace', postmortem: false, unsafe: false do |arg|
         if (re = /\s+into:\s*(.+)/) =~ arg
           into = $1
           arg.sub!(re, '')
@@ -852,19 +911,19 @@ module DEBUGGER__
             @ui.puts "* \##{i} #{t}"
           }
           @ui.puts
-          return :retry
+          :retry
 
         when /\Aline\z/
           add_tracer LineTracer.new(@ui, pattern: pattern, into: into)
-          return :retry
+          :retry
 
         when /\Acall\z/
           add_tracer CallTracer.new(@ui, pattern: pattern, into: into)
-          return :retry
+          :retry
 
         when /\Aexception\z/
           add_tracer ExceptionTracer.new(@ui, pattern: pattern, into: into)
-          return :retry
+          :retry
 
         when /\Aobject\s+(.+)/
           request_tc [:trace, :object, $1.strip, {pattern: pattern, into: into}]
@@ -876,7 +935,7 @@ module DEBUGGER__
           else
             @ui.puts "Unmatched: #{$1}"
           end
-          return :retry
+          :retry
 
         when /\Aoff(\s+(line|call|exception|object))?\z/
           @tracers.values.each{|t|
@@ -885,12 +944,13 @@ module DEBUGGER__
               @ui.puts "Disable #{t.to_s}"
             end
           }
-          return :retry
+          :retry
 
         else
           @ui.puts "Unknown trace option: #{arg.inspect}"
-          return :retry
+          :retry
         end
+      end
 
       # Record
       # * `record`
@@ -902,14 +962,15 @@ module DEBUGGER__
       #   * `s[tep]` does stepping forward with the last log.
       # * `step reset`
       #   * Stop replay .
-      when 'record'
+      register_command 'record', postmortem: false, unsafe: false do |arg|
         case arg
         when nil, 'on', 'off'
           request_tc [:record, arg&.to_sym]
         else
           @ui.puts "unknown command: #{arg}"
-          return :retry
+          :retry
         end
+      end
 
       ### Thread control
 
@@ -917,7 +978,7 @@ module DEBUGGER__
       #   * Show all threads.
       # * `th[read] <thnum>`
       #   * Switch thread specified by `<thnum>`.
-      when 'th', 'thread'
+      register_command 'th', 'thread', unsafe: false do |arg|
         case arg
         when nil, 'list', 'l'
           thread_list
@@ -926,7 +987,8 @@ module DEBUGGER__
         else
           @ui.puts "unknown thread command: #{arg}"
         end
-        return :retry
+        :retry
+      end
 
       ### Configuration
       # * `config`
@@ -939,13 +1001,14 @@ module DEBUGGER__
       #   * Append `<val>` to `<name>` if it is an array.
       # * `config unset <name>`
       #   * Set <name> to default.
-      when 'config'
+      register_command 'config', unsafe: false do |arg|
         config_command arg
-        return :retry
+        :retry
+      end
 
       # * `source <file>`
       #   * Evaluate lines in `<file>` as debug commands.
-      when 'source'
+      register_command 'source' do |arg|
         if arg
           begin
             cmds = File.readlines(path = File.expand_path(arg))
@@ -956,7 +1019,8 @@ module DEBUGGER__
         else
           show_help 'source'
         end
-        return :retry
+        :retry
+      end
 
       # * `open`
       #   * open debuggee port on UNIX domain socket and wait for attaching.
@@ -967,26 +1031,28 @@ module DEBUGGER__
       #   * open debuggee port for VSCode and launch VSCode if available.
       # * `open chrome`
       #   * open debuggee port for Chrome and wait for attaching.
-      when 'open'
+      register_command 'open' do |arg|
         case arg&.downcase
         when '', nil
-          repl_open
-        when 'vscode'
-          repl_open_vscode
-        when /\A(.+):(\d+)\z/
-          repl_open_tcp $1, $2.to_i
+          ::DEBUGGER__.open nonstop: true
         when /\A(\d+)z/
-          repl_open_tcp nil, $1.to_i
+          ::DEBUGGER__.open_tcp host: nil, port: $1.to_i, nonstop: true
+        when /\A(.+):(\d+)\z/
+          ::DEBUGGER__.open_tcp host: $1, port: $2.to_i, nonstop: true
         when 'tcp'
-          repl_open_tcp CONFIG[:host], (CONFIG[:port] || 0)
+          ::DEBUGGER__.open_tcp host: CONFIG[:host], port: (CONFIG[:port] || 0), nonstop: true
+        when 'vscode'
+          CONFIG[:open] = 'vscode'
+          ::DEBUGGER__.open nonstop: true
         when 'chrome', 'cdp'
-          CONFIG[:open_frontend] = 'chrome'
-          repl_open_tcp CONFIG[:host], (CONFIG[:port] || 0)
+          CONFIG[:open] = 'chrome'
+          ::DEBUGGER__.open_tcp host: CONFIG[:host], port: (CONFIG[:port] || 0), nonstop: true
         else
           raise "Unknown arg: #{arg}"
         end
 
-        return :retry
+        :retry
+      end
 
       ### Help
 
@@ -994,26 +1060,38 @@ module DEBUGGER__
       #   * Show help for all commands.
       # * `h[elp] <command>`
       #   * Show help for the given command.
-      when 'h', 'help', '?'
+      register_command 'h', 'help', '?', unsafe: false do |arg|
         show_help arg
-        return :retry
+        :retry
+      end
+    end
 
-      ### END
-      else
-        request_tc [:eval, :pp, line]
-=begin
-        @repl_prev_line = nil
-        @ui.puts "unknown command: #{line}"
-        begin
-          require 'did_you_mean'
-          spell_checker = DidYouMean::SpellChecker.new(dictionary: DEBUGGER__.commands)
-          correction = spell_checker.correct(line.split(/\s/).first || '')
-          @ui.puts "Did you mean? #{correction.join(' or ')}" unless correction.empty?
-        rescue LoadError
-          # Don't use D
+    def process_command line
+      if line.empty?
+        if @repl_prev_line
+          line = @repl_prev_line
+        else
+          return :retry
         end
-        return :retry
-=end
+      else
+        @repl_prev_line = line
+      end
+
+      /([^\s]+)(?:\s+(.+))?/ =~ line
+      cmd_name, cmd_arg = $1, $2
+
+      if cmd = @commands[cmd_name]
+        check_postmortem      if !cmd.postmortem
+        check_unsafe          if cmd.unsafe
+        cancel_auto_continue  if cmd.cancel_auto_continue
+        @repl_prev_line = nil if !cmd.repeat
+
+        cmd.block.call(cmd_arg)
+      else
+        @repl_prev_line = nil
+        check_unsafe
+
+        request_tc [:eval, :pp, line]
       end
 
     rescue Interrupt
@@ -1029,31 +1107,12 @@ module DEBUGGER__
       return :retry
     end
 
-    def repl_open_setup
-      @tp_thread_begin.disable
-      @ui.activate self
-      if @ui.respond_to?(:reader_thread) && thc = get_thread_client(@ui.reader_thread)
-        thc.mark_as_management
-      end
-      @tp_thread_begin.enable
-    end
-
-    def repl_open_tcp host, port, **kw
-      DEBUGGER__.open_tcp host: host, port: port, nonstop: true, **kw
-      repl_open_setup
-    end
-
-    def repl_open
-      DEBUGGER__.open nonstop: true
-      repl_open_setup
-    end
-
-    def repl_open_vscode
-      CONFIG[:open_frontend] = 'vscode'
-      repl_open
-    end
-
     def step_command type, arg
+      if type == :until
+        leave_subsession [:step, type, arg]
+        return
+      end
+
       case arg
       when nil, /\A\d+\z/
         if type == :in && @tc.recorder&.replaying?
@@ -1216,6 +1275,10 @@ module DEBUGGER__
 
     # breakpoint management
 
+    def bps_pending_until_load?
+      @bps.any?{|key, bp| bp.pending_until_load?}
+    end
+
     def iterate_bps
       deleted_bps = []
       i = 0
@@ -1262,8 +1325,6 @@ module DEBUGGER__
 
     def add_bp bp
       # don't repeat commands that add breakpoints
-      @repl_prev_line = nil
-
       if @bps.has_key? bp.key
         if bp.duplicable?
           bp
@@ -1295,7 +1356,7 @@ module DEBUGGER__
 
     BREAK_KEYWORDS = %w(if: do: pre: path:).freeze
 
-    def parse_break arg
+    private def parse_break type, arg
       mode = :sig
       expr = Hash.new{|h, k| h[k] = []}
       arg.split(' ').each{|w|
@@ -1312,13 +1373,18 @@ module DEBUGGER__
         expr[:path] = Regexp.compile($1)
       end
 
+      if expr[:do] || expr[:pre]
+        check_unsafe
+        expr[:cmd] = [type, expr[:pre], expr[:do]]
+      end
+
       expr
     end
 
     def repl_add_breakpoint arg
-      expr = parse_break arg.strip
+      expr = parse_break 'break', arg.strip
       cond = expr[:if]
-      cmd = ['break', expr[:pre], expr[:do]] if expr[:pre] || expr[:do]
+      cmd  = expr[:cmd]
       path = expr[:path]
 
       case expr[:sig]
@@ -1339,9 +1405,9 @@ module DEBUGGER__
     end
 
     def repl_add_catch_breakpoint arg
-      expr = parse_break arg.strip
+      expr = parse_break 'catch', arg.strip
       cond = expr[:if]
-      cmd = ['catch', expr[:pre], expr[:do]] if expr[:pre] || expr[:do]
+      cmd  = expr[:cmd]
       path = expr[:path]
 
       bp = CatchBreakpoint.new(expr[:sig], cond: cond, command: cmd, path: path)
@@ -1349,9 +1415,9 @@ module DEBUGGER__
     end
 
     def repl_add_watch_breakpoint arg
-      expr = parse_break arg.strip
+      expr = parse_break 'watch', arg.strip
       cond = expr[:if]
-      cmd = ['watch', expr[:pre], expr[:do]] if expr[:pre] || expr[:do]
+      cmd  = expr[:cmd]
       path = Regexp.compile(expr[:path]) if expr[:path]
 
       request_tc [:breakpoint, :watch, expr[:sig], cond, cmd, path]
@@ -1412,8 +1478,6 @@ module DEBUGGER__
     # tracers
 
     def add_tracer tracer
-      # don't repeat commands that add tracers
-      @repl_prev_line = nil
       if @tracers.has_key? tracer.key
         tracer.disable
         @ui.puts "Duplicated tracer: #{tracer}"
@@ -1571,10 +1635,11 @@ module DEBUGGER__
     end
 
     private def enter_subsession
+      @subsession_id += 1
       if !@subsession_stack.empty?
-        DEBUGGER__.info "Enter subsession (nested #{@subsession_stack.size})"
+        DEBUGGER__.debug{ "Enter subsession (nested #{@subsession_stack.size})" }
       else
-        DEBUGGER__.info "Enter subsession"
+        DEBUGGER__.debug{ "Enter subsession" }
         stop_all_threads
         @process_group.lock
       end
@@ -1587,11 +1652,11 @@ module DEBUGGER__
       @subsession_stack.pop
 
       if @subsession_stack.empty?
-        DEBUGGER__.info "Leave subsession"
+        DEBUGGER__.debug{ "Leave subsession" }
         @process_group.unlock
         restart_all_threads
       else
-        DEBUGGER__.info "Leave subsession (nested #{@subsession_stack.size})"
+        DEBUGGER__.debug{ "Leave subsession (nested #{@subsession_stack.size})" }
       end
 
       request_tc type if type
@@ -1727,6 +1792,12 @@ module DEBUGGER__
     def check_postmortem
       if @postmortem
         raise PostmortemError, "Can not use this command on postmortem mode."
+      end
+    end
+
+    def check_unsafe
+      if @unsafe_context
+        raise RuntimeError, "#{@repl_prev_line.dump} is not allowed on unsafe context."
       end
     end
 
@@ -1913,7 +1984,7 @@ module DEBUGGER__
     end
 
     def locked?
-      # DEBUGGER__.info "locked? #{@lock_level}"
+      # DEBUGGER__.debug{ "locked? #{@lock_level}" }
       @lock_level > 0
     end
 
@@ -2034,19 +2105,22 @@ module DEBUGGER__
   def self.start nonstop: false, **kw
     CONFIG.set_config(**kw)
 
-    unless defined? SESSION
-      require_relative 'local'
-      initialize_session{ UI_LocalConsole.new }
+    if CONFIG[:open]
+      open nonstop: nonstop, **kw
+    else
+      unless defined? SESSION
+        require_relative 'local'
+        initialize_session{ UI_LocalConsole.new }
+      end
+      setup_initial_suspend unless nonstop
     end
-
-    setup_initial_suspend unless nonstop
   end
 
   def self.open host: nil, port: CONFIG[:port], sock_path: nil, sock_dir: nil, nonstop: false, **kw
     CONFIG.set_config(**kw)
     require_relative 'server'
 
-    if port || CONFIG[:open_frontend] == 'chrome' || (!::Addrinfo.respond_to?(:unix))
+    if port || CONFIG[:open] == 'chrome' || (!::Addrinfo.respond_to?(:unix))
       open_tcp host: host, port: (port || 0), nonstop: nonstop
     else
       open_unix sock_path: sock_path, sock_dir: sock_dir, nonstop: nonstop
@@ -2105,6 +2179,18 @@ module DEBUGGER__
       ::DEBUGGER__.const_set(:SESSION, Session.new)
       SESSION.activate init_ui.call
       load_rc
+    end
+  end
+
+  # Exiting control
+
+  class << self
+    def skip_all
+      @skip_all = true
+    end
+
+    def skip?
+      @skip_all
     end
   end
 
@@ -2305,19 +2391,19 @@ module DEBUGGER__
           # Do nothing
         }
         child_hook = -> {
-          DEBUGGER__.warn "Detaching after fork from child process #{Process.pid}"
+          DEBUGGER__.info "Detaching after fork from child process #{Process.pid}"
           SESSION.deactivate
         }
       when :child
         SESSION.before_fork false
 
         parent_hook = -> child_pid {
-          DEBUGGER__.warn "Detaching after fork from parent process #{Process.pid}"
+          DEBUGGER__.info "Detaching after fork from parent process #{Process.pid}"
           SESSION.after_fork_parent
           SESSION.deactivate
         }
         child_hook = -> {
-          DEBUGGER__.warn "Attaching after process #{parent_pid} fork to child process #{Process.pid}"
+          DEBUGGER__.info "Attaching after process #{parent_pid} fork to child process #{Process.pid}"
           SESSION.activate on_fork: true
         }
       when :both
@@ -2328,7 +2414,7 @@ module DEBUGGER__
           SESSION.after_fork_parent
         }
         child_hook = -> {
-          DEBUGGER__.warn "Attaching after process #{parent_pid} fork to child process #{Process.pid}"
+          DEBUGGER__.info "Attaching after process #{parent_pid} fork to child process #{Process.pid}"
           SESSION.process_group.after_fork child: true
           SESSION.activate on_fork: true
         }
@@ -2406,10 +2492,17 @@ module Kernel
     return if !defined?(::DEBUGGER__::SESSION) || !::DEBUGGER__::SESSION.active?
 
     if pre || (do_expr = binding.local_variable_get(:do))
-      cmds = ['binding.break', pre, do_expr]
+      cmds = ['#debugger', pre, do_expr]
     end
 
-    loc = caller_locations(up_level, 1).first; ::DEBUGGER__.add_line_breakpoint loc.path, loc.lineno + 1, oneshot: true, command: cmds
+    if ::DEBUGGER__::SESSION.in_subsession?
+      if cmds
+        commands = [*cmds[1], *cmds[2]].map{|c| c.split(';;').join("\n")}
+        ::DEBUGGER__::SESSION.add_preset_commands cmds[0], commands, kick: false, continue: false
+      end
+    else
+      loc = caller_locations(up_level, 1).first; ::DEBUGGER__.add_line_breakpoint loc.path, loc.lineno + 1, oneshot: true, command: cmds
+    end
     self
   end
 

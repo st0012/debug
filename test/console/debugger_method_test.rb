@@ -3,23 +3,23 @@
 require_relative '../support/console_test_case'
 
 module DEBUGGER__
-  class DebugStatementTest < ConsoleTestCase
-    STATEMENT_PLACE_HOLDER = "__BREAK_STATEMENT__"
-    SUPPORTED_DEBUG_STATEMENTS = %w(binding.break binding.b debugger).freeze
+  class DebuggerMethodTest < ConsoleTestCase
+    METHOD_PLACE_HOLDER = "__BREAK_METHOD__"
+    SUPPORTED_DEBUG_METHODS = %w(debugger binding.break binding.b).freeze
 
     def debug_code(program)
-      SUPPORTED_DEBUG_STATEMENTS.each do |statement|
-        super(program.gsub(STATEMENT_PLACE_HOLDER, statement))
+      SUPPORTED_DEBUG_METHODS.each do |mid|
+        super(program.gsub(METHOD_PLACE_HOLDER, mid))
       end
     end
   end
 
-  class BasicTest < DebugStatementTest
+  class DebuggerMethodBasicTest < DebuggerMethodTest
     def program
       <<~RUBY
      1| class Foo
      2|   def bar
-     3|     #{STATEMENT_PLACE_HOLDER}
+     3|     #{METHOD_PLACE_HOLDER}
      4|   end
      5| end
      6|
@@ -31,22 +31,36 @@ module DEBUGGER__
       debug_code(program) do
         type 'continue'
         assert_line_text('Foo#bar')
-        type 'q!'
+        type 'kill!'
+      end
+    end
+
+    def test_debugger_method_in_subsession
+      debug_code program do
+        type 'c'
+        assert_line_num 3
+        type 'eval debugger do: "p 2 ** 32"'
+        assert_line_text('4294967296')
+        type 'eval debugger do: "p 2 ** 32;; n;; p 2 ** 33;;"'
+        assert_line_num 4
+        assert_line_text('4294967296')
+        assert_line_text('8589934592')
+        type 'c'
       end
     end
   end
 
-  class DebugStatementWithPreCommandTest < DebugStatementTest
+  class DebuggerMethodWithPreCommandTest < DebuggerMethodTest
     def program
       <<~RUBY
      1| class Foo
      2|   def bar
-     3|     #{STATEMENT_PLACE_HOLDER}(pre: "p 'aaaaa'")
+     3|     #{METHOD_PLACE_HOLDER}(pre: "p 'aaaaa'")
      4|     baz
      5|   end
      6|
      7|   def baz
-     8|     #{STATEMENT_PLACE_HOLDER}
+     8|     #{METHOD_PLACE_HOLDER}
      9|   end
     10| end
     11|
@@ -72,22 +86,22 @@ module DEBUGGER__
       debug_code(program) do
         type 'continue'
         assert_no_line_text(/duplicated breakpoint:/)
-        type 'q!'
+        type 'kill!'
       end
     end
   end
 
-  class DebugStatementWithDoCommandTest < DebugStatementTest
+  class DebuggerMethodWithDoCommandTest < DebuggerMethodTest
     def program
       <<~RUBY
      1| class Foo
      2|   def bar
-     3|     #{STATEMENT_PLACE_HOLDER}(do: "p 'aaaaa'")
+     3|     #{METHOD_PLACE_HOLDER}(do: "p 'aaaaa'")
      4|     baz
      5|   end
      6|
      7|   def baz
-     8|     #{STATEMENT_PLACE_HOLDER}
+     8|     #{METHOD_PLACE_HOLDER}
      9|   end
     10| end
     11|
@@ -109,22 +123,22 @@ module DEBUGGER__
       debug_code(program) do
         type 'continue'
         assert_no_line_text(/duplicated breakpoint:/)
-        type 'q!'
+        type 'kill!'
       end
     end
 
-    class ThreadManagementTest < DebugStatementTest
+    class ThreadManagementTest < DebuggerMethodTest
       def program
         <<~RUBY
          1| Thread.new do
-         2|   #{STATEMENT_PLACE_HOLDER}(do: "p 'foo' + 'bar'")
+         2|   #{METHOD_PLACE_HOLDER}(do: "p 'foo' + 'bar'")
          3| end.join
          4|
          5| Thread.new do
-         6|   #{STATEMENT_PLACE_HOLDER}(do: "p 'bar' + 'baz'")
+         6|   #{METHOD_PLACE_HOLDER}(do: "p 'bar' + 'baz'")
          7| end.join
          8|
-         9| #{STATEMENT_PLACE_HOLDER}
+         9| #{METHOD_PLACE_HOLDER}
         RUBY
       end
 

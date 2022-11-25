@@ -1,7 +1,6 @@
 # frozen_string_literal: true
 
 require 'socket'
-require 'etc'
 require_relative 'config'
 require_relative 'version'
 
@@ -22,6 +21,7 @@ module DEBUGGER__
 
     class Terminate < StandardError; end
     class GreetingError < StandardError; end
+    class RetryConnection < StandardError; end
 
     def deactivate
       @reader_thread.raise Terminate
@@ -78,6 +78,8 @@ module DEBUGGER__
           next
         rescue Terminate
           raise # should catch at outer scope
+        rescue RetryConnection
+          next
         rescue => e
           DEBUGGER__.warn "ReaderThreadError: #{e}"
           pp e.backtrace
@@ -128,6 +130,8 @@ module DEBUGGER__
     def greeting
       case g = @sock.gets
       when /^info cookie:\s+(.*)$/
+        require 'etc'
+
         check_cookie $1
         @sock.puts "PID: #{Process.pid}, $0: #{$0}"
         @sock.puts "debug #{VERSION} on #{RUBY_DESCRIPTION}"
@@ -157,16 +161,13 @@ module DEBUGGER__
         @need_pause_at_first = false
         dap_setup @sock.read($1.to_i)
 
-      when /^GET \/.* HTTP\/1.1/
+      when /^GET\s\/json\sHTTP\/1.1/, /^GET\s\/json\/version\sHTTP\/1.1/, /^GET\s\/\w{8}-\w{4}-\w{4}-\w{4}-\w{12}\sHTTP\/1.1/
+        # The reason for not using @uuid here is @uuid is nil if users run debugger without `--open=chrome`.
+
         require_relative 'server_cdp'
 
         self.extend(UI_CDP)
-        @repl = false
-        @need_pause_at_first = false
-        CONFIG.set_config no_color: true
-
-        @ws_server = UI_CDP::WebSocketServer.new(@sock)
-        @ws_server.handshake
+        send_chrome_response g
       else
         raise GreetingError, "Unknown greeting message: #{g}"
       end
@@ -174,17 +175,17 @@ module DEBUGGER__
 
     def process
       while true
-        DEBUGGER__.info "sleep IO.select"
-        r = IO.select([@sock])
-        DEBUGGER__.info "wakeup IO.select"
+        DEBUGGER__.debug{ "sleep IO.select" }
+        _r = IO.select([@sock])
+        DEBUGGER__.debug{ "wakeup IO.select" }
 
         line = @session.process_group.sync do
           unless IO.select([@sock], nil, nil, 0)
-            DEBUGGER__.info "UI_Server can not read"
+            DEBUGGER__.debug{ "UI_Server can not read" }
             break :can_not_read
           end
           @sock.gets&.chomp.tap{|line|
-            DEBUGGER__.info "UI_Server received: #{line}"
+            DEBUGGER__.debug{ "UI_Server received: #{line}" }
           }
         end
 
@@ -340,12 +341,12 @@ module DEBUGGER__
         if @repl
           raise "not in subsession, but received: #{line.inspect}" unless @session.in_subsession?
           line = "input #{Process.pid}"
-          DEBUGGER__.info "send: #{line}"
+          DEBUGGER__.debug{ "send: #{line}" }
           s.puts line
         end
         sleep 0.01 until @q_msg
         @q_msg.pop.tap{|msg|
-          DEBUGGER__.info "readline: #{msg.inspect}"
+          DEBUGGER__.debug{ "readline: #{msg.inspect}" }
         }
       end || 'continue')
 
@@ -361,7 +362,7 @@ module DEBUGGER__
       Process.kill(TRAP_SIGNAL, Process.pid)
     end
 
-    def quit n
+    def quit n, &_b
       # ignore n
       sock do |s|
         s.puts "quit"
@@ -395,6 +396,7 @@ module DEBUGGER__
           raise "Specify digits for port number"
         end
       end
+      @uuid = nil # for CDP
 
       super()
     end
@@ -402,11 +404,12 @@ module DEBUGGER__
     def chrome_setup
       require_relative 'server_cdp'
 
-      unless @chrome_pid = UI_CDP.setup_chrome(@local_addr.inspect_sockaddr)
+      @uuid = SecureRandom.uuid
+      unless @chrome_pid = UI_CDP.setup_chrome(@local_addr.inspect_sockaddr, @uuid)
         DEBUGGER__.warn <<~EOS
           With Chrome browser, type the following URL in the address-bar:
 
-             devtools://devtools/bundled/inspector.html?v8only=true&panel=sources&ws=#{@local_addr.inspect_sockaddr}/#{SecureRandom.uuid}
+             devtools://devtools/bundled/inspector.html?v8only=true&panel=sources&ws=#{@local_addr.inspect_sockaddr}/#{@uuid}
 
           EOS
       end
@@ -427,14 +430,14 @@ module DEBUGGER__
             DEBUGGER__.warn "Port is saved into #{@port_save_file}"
           end
 
-          DEBUGGER__.info <<~EOS
+          DEBUGGER__.warn <<~EOS
           With rdbg, use the following command line:
           #
           #   #{rdbg} --attach #{@local_addr.ip_address} #{@local_addr.ip_port}
           #
           EOS
 
-          case CONFIG[:open_frontend]
+          case CONFIG[:open]
           when 'chrome'
             chrome_setup
           when 'vscode'
@@ -491,7 +494,7 @@ module DEBUGGER__
       end
 
       ::DEBUGGER__.warn "Debugger can attach via UNIX domain socket (#{@sock_path})"
-      vscode_setup @sock_path if CONFIG[:open_frontend] == 'vscode'
+      vscode_setup @sock_path if CONFIG[:open] == 'vscode'
 
       begin
         Socket.unix_server_loop @sock_path do |sock, client|

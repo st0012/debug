@@ -18,7 +18,7 @@ module DEBUGGER__
       end
 
       at_exit do
-        CONFIG.skip_all
+        DEBUGGER__.skip_all
         FileUtils.rm_rf dir if tempdir
       end
 
@@ -273,17 +273,22 @@ module DEBUGGER__
         when 'launch'
           send_response req
           UI_DAP.local_fs_map_set req.dig('arguments', 'localfs') || req.dig('arguments', 'localfsMap')
-          @is_launch = true
+          @nonstop = true
 
         when 'attach'
           send_response req
           UI_DAP.local_fs_map_set req.dig('arguments', 'localfs') || req.dig('arguments', 'localfsMap')
-          @is_launch = false
+
+          if req.dig('arguments', 'nonstop') == true
+            @nonstop = true
+          else
+            @nonstop = false
+          end
 
         when 'configurationDone'
           send_response req
 
-          if @is_launch
+          if @nonstop
             @q_msg << 'continue'
           else
             if SESSION.in_subsession?
@@ -685,10 +690,20 @@ module DEBUGGER__
     end
   end
 
+  class NaiveString
+    attr_reader :str
+    def initialize str
+      @str = str
+    end
+  end
+
   class ThreadClient
-    def value_inspect obj
+
+    MAX_LENGTH = 180
+    
+    def value_inspect obj, short: true
       # TODO: max length should be configuarable?
-      str = DEBUGGER__.safe_inspect obj, short: true, max_length: 4 * 1024
+      str = DEBUGGER__.safe_inspect obj, short: short, max_length: MAX_LENGTH
 
       if str.encoding == Encoding::UTF_8
         str.scrub
@@ -800,13 +815,11 @@ module DEBUGGER__
             when String
               vars = [
                 variable('#length', obj.length),
-                variable('#encoding', obj.encoding)
+                variable('#encoding', obj.encoding),
               ]
+              vars << variable('#dump', NaiveString.new(obj)) if obj.length > MAX_LENGTH
             when Class, Module
-              vars = obj.instance_variables.map{|iv|
-                variable(iv, obj.instance_variable_get(iv))
-              }
-              vars.unshift variable('%ancestors', obj.ancestors[1..])
+              vars << variable('%ancestors', obj.ancestors[1..])
             when Range
               vars = [
                 variable('#begin', obj.begin),
@@ -814,10 +827,12 @@ module DEBUGGER__
               ]
             end
 
-            vars += M_INSTANCE_VARIABLES.bind_call(obj).map{|iv|
-              variable(iv, M_INSTANCE_VARIABLE_GET.bind_call(obj, iv))
-            }
-            vars.unshift variable('#class', M_CLASS.bind_call(obj))
+            unless NaiveString === obj
+              vars += M_INSTANCE_VARIABLES.bind_call(obj).sort.map{|iv|
+                variable(iv, M_INSTANCE_VARIABLE_GET.bind_call(obj, iv))
+              }
+              vars.unshift variable('#class', M_CLASS.bind_call(obj))
+            end
           end
         end
         event! :dap_result, :variable, req, variables: (vars || []), tid: self.id
@@ -935,11 +950,17 @@ module DEBUGGER__
     end
 
     def evaluate_result r
-      v = variable nil, r
-      v.delete :name
-      v.delete :value
-      v[:result] = value_inspect(r)
-      v
+      variable nil, r
+    end
+
+    def type_name obj
+      klass = M_CLASS.bind_call(obj)
+
+      begin
+        klass.name || klass.to_s
+      rescue Exception => e
+        "<Error: #{e.message} (#{e.backtrace.first}>"
+      end
     end
 
     def variable_ name, obj, indexedVariables: 0, namedVariables: 0
@@ -950,15 +971,31 @@ module DEBUGGER__
         vid = 0
       end
 
-      ivnum = M_INSTANCE_VARIABLES.bind_call(obj).size
+      namedVariables += M_INSTANCE_VARIABLES.bind_call(obj).size
 
-      { name: name,
-        value: value_inspect(obj),
-        type: (klass = M_CLASS.bind_call(obj)).name || klass.to_s,
-        variablesReference: vid,
-        indexedVariables: indexedVariables,
-        namedVariables: namedVariables + ivnum,
-      }
+      if NaiveString === obj
+        str = obj.str.dump
+        vid = indexedVariables = namedVariables = 0
+      else
+        str = value_inspect(obj)
+      end
+
+      if name
+        { name: name,
+          value: str,
+          type: type_name(obj),
+          variablesReference: vid,
+          indexedVariables: indexedVariables,
+          namedVariables: namedVariables,
+        }
+      else
+        { result: str,
+          type: type_name(obj),
+          variablesReference: vid,
+          indexedVariables: indexedVariables,
+          namedVariables: namedVariables,
+        }
+      end
     end
 
     def variable name, obj
@@ -968,7 +1005,7 @@ module DEBUGGER__
       when Hash
         variable_ name, obj, namedVariables: obj.size
       when String
-        variable_ name, obj, namedVariables: 3 # #to_str, #length, #encoding
+        variable_ name, obj, namedVariables: 3 # #length, #encoding, #to_str
       when Struct
         variable_ name, obj, namedVariables: obj.size
       when Class, Module

@@ -7,13 +7,18 @@ require 'securerandom'
 require 'stringio'
 require 'open3'
 require 'tmpdir'
+require 'tempfile'
+require 'timeout'
 
 module DEBUGGER__
   module UI_CDP
     SHOW_PROTOCOL = ENV['RUBY_DEBUG_CDP_SHOW_PROTOCOL'] == '1'
 
+    class UnsupportedError < StandardError; end
+    class NotFoundChromeEndpointError < StandardError; end
+
     class << self
-      def setup_chrome addr
+      def setup_chrome addr, uuid
         return if CONFIG[:chrome_path] == ''
 
         port, path, pid = run_new_chrome
@@ -51,7 +56,7 @@ module DEBUGGER__
             ws_client.send sessionId: s_id, id: 5,
                           method: 'Page.navigate',
                           params: {
-                            url: "devtools://devtools/bundled/inspector.html?v8only=true&panel=sources&ws=#{addr}/#{SecureRandom.uuid}",
+                            url: "devtools://devtools/bundled/inspector.html?v8only=true&panel=sources&ws=#{addr}/#{uuid}",
                             frameId: f_id
                           }
           when res['method'] == 'Page.loadEventFired'
@@ -59,47 +64,172 @@ module DEBUGGER__
           end
         end
         pid
-      rescue Errno::ENOENT
+      rescue Errno::ENOENT, UnsupportedError, NotFoundChromeEndpointError
         nil
       end
 
-      def get_chrome_path
-        return CONFIG[:chrome_path] if CONFIG[:chrome_path]
+      TIMEOUT_SEC = 5
+
+      def run_new_chrome
+        path = CONFIG[:chrome_path]
+
+        data = nil
+        port = nil
+        wait_thr = nil
 
         # The process to check OS is based on `selenium` project.
         case RbConfig::CONFIG['host_os']
         when /mswin|msys|mingw|cygwin|emc/
-          'C:\Program Files (x86)\Google\Chrome\Application\chrome.exe'
+          if path.nil?
+            candidates = ['C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe', 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe']
+            path = get_chrome_path candidates
+          end
+          uuid = SecureRandom.uuid
+          # The path is based on https://github.com/sindresorhus/open/blob/v8.4.0/index.js#L128.
+          stdin, stdout, stderr, wait_thr = *Open3.popen3("#{ENV['SystemRoot']}\\System32\\WindowsPowerShell\\v1.0\\powershell")
+          tf = Tempfile.create(['debug-', '.txt'])
+
+          stdin.puts("Start-process '#{path}' -Argumentlist '--remote-debugging-port=0', '--no-first-run', '--no-default-browser-check', '--user-data-dir=C:\\temp' -Wait -RedirectStandardError #{tf.path}")
+          stdin.close
+          stdout.close
+          stderr.close
+          port, path = get_devtools_endpoint(tf.path)
+
+          at_exit{
+            DEBUGGER__.skip_all
+
+            stdin, stdout, stderr, wait_thr = *Open3.popen3("#{ENV['SystemRoot']}\\System32\\WindowsPowerShell\\v1.0\\powershell")
+            stdin.puts("Stop-process -Name chrome")
+            stdin.close
+            stdout.close
+            stderr.close
+            tf.close
+            begin
+              File.unlink(tf)
+            rescue Errno::EACCES
+            end
+          }
         when /darwin|mac os/
-          '/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome'
+          path = path || '/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome'
+          dir = Dir.mktmpdir
+          # The command line flags are based on: https://developer.mozilla.org/en-US/docs/Tools/Remote_Debugging/Chrome_Desktop#connecting.
+          stdin, stdout, stderr, wait_thr = *Open3.popen3("#{path} --remote-debugging-port=0 --no-first-run --no-default-browser-check --user-data-dir=#{dir}")
+          stdin.close
+          stdout.close
+          data = stderr.readpartial 4096
+          stderr.close
+          if data.match /DevTools listening on ws:\/\/127.0.0.1:(\d+)(.*)/
+            port = $1
+            path = $2
+          end
+
+          at_exit{
+            DEBUGGER__.skip_all
+            FileUtils.rm_rf dir
+          }
         when /linux/
-          'google-chrome'
+          path = path || 'google-chrome'
+          dir = Dir.mktmpdir
+          # The command line flags are based on: https://developer.mozilla.org/en-US/docs/Tools/Remote_Debugging/Chrome_Desktop#connecting.
+          stdin, stdout, stderr, wait_thr = *Open3.popen3("#{path} --remote-debugging-port=0 --no-first-run --no-default-browser-check --user-data-dir=#{dir}")
+          stdin.close
+          stdout.close
+          data = ''
+          begin
+            Timeout.timeout(TIMEOUT_SEC) do
+              until data.match?(/DevTools listening on ws:\/\/127.0.0.1:\d+.*/)
+                data = stderr.readpartial 4096
+              end
+            end
+          rescue Exception
+            raise NotFoundChromeEndpointError
+          end
+          stderr.close
+          if data.match /DevTools listening on ws:\/\/127.0.0.1:(\d+)(.*)/
+            port = $1
+            path = $2
+          end
+
+          at_exit{
+            DEBUGGER__.skip_all
+            FileUtils.rm_rf dir
+          }
         else
-          raise "Unsupported OS"
+          raise UnsupportedError
         end
-      end
-
-      def run_new_chrome
-        dir = Dir.mktmpdir
-        # The command line flags are based on: https://developer.mozilla.org/en-US/docs/Tools/Remote_Debugging/Chrome_Desktop#connecting
-        stdin, stdout, stderr, wait_thr = *Open3.popen3("#{get_chrome_path} --remote-debugging-port=0 --no-first-run --no-default-browser-check --user-data-dir=#{dir}")
-        stdin.close
-        stdout.close
-
-        data = stderr.readpartial 4096
-        if data.match /DevTools listening on ws:\/\/127.0.0.1:(\d+)(.*)/
-          port = $1
-          path = $2
-        end
-        stderr.close
-
-        at_exit{
-          CONFIG.skip_all
-          FileUtils.rm_rf dir
-        }
 
         [port, path, wait_thr.pid]
       end
+
+      def get_chrome_path candidates
+        candidates.each{|c|
+          if File.exist? c
+            return c
+          end
+        }
+        raise UnsupportedError
+      end
+
+      ITERATIONS = 50
+
+      def get_devtools_endpoint tf
+        i = 1
+        while i < ITERATIONS
+          i += 1
+          if File.exist?(tf) && data = File.read(tf)
+            if data.match /DevTools listening on ws:\/\/127.0.0.1:(\d+)(.*)/
+              port = $1
+              path = $2
+              return [port, path]
+            end
+          end
+          sleep 0.1
+        end
+        raise NotFoundChromeEndpointError
+      end
+    end
+
+    def send_chrome_response req
+      @repl = false
+      case req
+      when /^GET\s\/json\/version\sHTTP\/1.1/
+        body = {
+          Browser: "ruby/v#{RUBY_VERSION}",
+          'Protocol-Version': "1.1"
+        }
+        send_http_res body
+        raise UI_ServerBase::RetryConnection
+
+      when /^GET\s\/json\sHTTP\/1.1/
+        @uuid = @uuid || SecureRandom.uuid
+        addr = @local_addr.inspect_sockaddr
+        body = [{
+          description: "ruby instance",
+          devtoolsFrontendUrl: "devtools://devtools/bundled/inspector.html?experiments=true&v8only=true&ws=#{addr}/#{@uuid}",
+          id: @uuid,
+          title: $0,
+          type: "node",
+          url: "file://#{File.absolute_path($0)}",
+          webSocketDebuggerUrl: "ws://#{addr}/#{@uuid}"
+        }]
+        send_http_res body
+        raise UI_ServerBase::RetryConnection
+
+      when /^GET\s\/(\w{8}-\w{4}-\w{4}-\w{4}-\w{12})\sHTTP\/1.1/
+        raise 'Incorrect uuid' unless $1 == @uuid
+
+        @need_pause_at_first = false
+        CONFIG.set_config no_color: true
+
+        @ws_server = WebSocketServer.new(@sock)
+        @ws_server.handshake
+      end
+    end
+
+    def send_http_res body
+      json = JSON.generate body
+      header = "HTTP/1.0 200 OK\r\nContent-Type: application/json; charset=UTF-8\r\nCache-Control: no-cache\r\nContent-Length: #{json.bytesize}\r\n\r\n"
+      @sock.puts "#{header}#{json}"
     end
 
     module WebSocketUtils
@@ -527,12 +657,6 @@ module DEBUGGER__
     end
 
     ## Called by the SESSION thread
-
-    def readline prompt
-      return 'c' unless @q_msg
-
-      @q_msg.pop || 'kill!'
-    end
 
     def respond req, **result
       send_response req, **result
@@ -1051,19 +1175,23 @@ module DEBUGGER__
     end
 
     def preview_ value, hash, overflow
+      # The reason for not using "map" method is to prevent the object overriding it from causing bugs.
+      # https://github.com/ruby/debug/issues/781
+      props = []
+      hash.each{|k, v|
+        pd = propertyDescriptor k, v
+        props << {
+          name: pd[:name],
+          type: pd[:value][:type],
+          value: pd[:value][:description]
+        }
+      }
       {
         type: value[:type],
         subtype: value[:subtype],
         description: value[:description],
         overflow: overflow,
-        properties: hash.map{|k, v|
-          pd = propertyDescriptor k, v
-          {
-            name: pd[:name],
-            type: pd[:value][:type],
-            value: pd[:value][:description]
-          }
-        }
+        properties: props
       }
     end
 

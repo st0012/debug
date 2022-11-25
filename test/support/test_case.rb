@@ -121,7 +121,7 @@ module DEBUGGER__
     end
 
     def kill_safely pid, name, test_info
-      return if wait_pid pid, 3
+      return if wait_pid pid, TIMEOUT_SEC
 
       test_info.failed_process = name
 
@@ -142,10 +142,11 @@ module DEBUGGER__
     def kill_remote_debuggee test_info
       return unless r = test_info.remote_info
 
+      kill_safely r.pid, :remote, test_info
       r.reader_thread.kill
+      # Because the debuggee may be terminated by executing the following operations, we need to run them after `kill_safely` method.
       r.r.close
       r.w.close
-      kill_safely r.pid, :remote, test_info
     end
 
     def setup_remote_debuggee(cmd)
@@ -186,7 +187,31 @@ module DEBUGGER__
     def setup_tcpip_remote_debuggee
       remote_info = setup_remote_debuggee("#{RDBG_EXECUTABLE} -O --port=#{TCPIP_PORT} -- #{temp_file_path}")
       remote_info.port = TCPIP_PORT
+      Timeout.timeout(TIMEOUT_SEC) do
+        sleep 0.001 until remote_info.debuggee_backlog.join.include? remote_info.port.to_s
+      end
       remote_info
+    end
+
+    # Debuggee sometimes sends msgs such as "out [1, 5] in ...".
+    # This http request method is for ignoring them.
+    def get_request host, port, path
+      Timeout.timeout(TIMEOUT_SEC) do
+        Socket.tcp(host, port){|sock|
+          sock.print "GET #{path} HTTP/1.1\r\n"
+          sock.close_write
+          loop do
+            case header = sock.gets
+            when /Content-Length: (\d+)/
+              b = sock.read(2)
+              raise b.inspect unless b == "\r\n"
+      
+              l = sock.read $1.to_i
+              return JSON.parse l, symbolize_names: true
+            end
+          end
+        }
+      end
     end
   end
 end

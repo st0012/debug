@@ -18,7 +18,7 @@ module DEBUGGER__
   module SkipPathHelper
     def skip_path?(path)
       !path ||
-      CONFIG.skip? ||
+      DEBUGGER__.skip? ||
       ThreadClient.current.management? ||
       skip_internal_path?(path) ||
       skip_config_skip_path?(path)
@@ -291,8 +291,10 @@ module DEBUGGER__
       end
 
       if event != :pause
-        show_src
-        show_frames CONFIG[:show_frames]
+        unless bp&.skip_src
+          show_src
+          show_frames CONFIG[:show_frames]
+        end
 
         set_mode :waiting
 
@@ -328,11 +330,15 @@ module DEBUGGER__
       @step_tp.disable if @step_tp
 
       thread = Thread.current
+      subsession_id = SESSION.subsession_id
 
       if SUPPORT_TARGET_THREAD
         @step_tp = TracePoint.new(*events){|tp|
-          next if SESSION.break_at? tp.path, tp.lineno
-          next if !yield(tp.event)
+          if SESSION.stop_stepping? tp.path, tp.lineno, subsession_id
+            tp.disable
+            next
+          end
+          next if !yield(tp)
           next if tp.path.start_with?(__dir__)
           next if tp.path.start_with?('<internal:trace_point>')
           next unless File.exist?(tp.path) if CONFIG[:skip_nosrc]
@@ -347,8 +353,11 @@ module DEBUGGER__
       else
         @step_tp = TracePoint.new(*events){|tp|
           next if thread != Thread.current
-          next if SESSION.break_at? tp.path, tp.lineno
-          next if !yield(tp.event)
+          if SESSION.stop_stepping? tp.path, tp.lineno, subsession_id
+            tp.disable
+            next
+          end
+          next if !yield(tp)
           next if tp.path.start_with?(__dir__)
           next if tp.path.start_with?('<internal:trace_point>')
           next unless File.exist?(tp.path) if CONFIG[:skip_nosrc]
@@ -384,15 +393,19 @@ module DEBUGGER__
       end
     end
 
-    def frame_eval_core src, b
+    def frame_eval_core src, b, binding_location: false
       saved_target_frames = @target_frames
       saved_current_frame_index = @current_frame_index
 
       if b
-        f, _l = b.source_location
+        file, lineno = b.source_location
 
         tp_allow_reentry do
-          b.eval(src, "(rdbg)/#{f}")
+          if binding_location
+            b.eval(src, file, lineno)
+          else
+            b.eval(src, "(rdbg)/#{file}")
+          end
         end
       else
         frame_self = current_frame.self
@@ -411,7 +424,7 @@ module DEBUGGER__
       [:return_value,     "_return"],
     ]
 
-    def frame_eval src, re_raise: false
+    def frame_eval src, re_raise: false, binding_location: false
       @success_last_eval = false
 
       b = current_frame.eval_binding
@@ -420,7 +433,7 @@ module DEBUGGER__
         b.local_variable_set(name, var) if /\%/ !~ name
       end
 
-      result = frame_eval_core(src, b)
+      result = frame_eval_core(src, b, binding_location: binding_location)
 
       @success_last_eval = true
       result
@@ -824,6 +837,7 @@ module DEBUGGER__
           set_mode :waiting if !waiting?
           cmds = @q_cmd.pop
           # pp [self, cmds: cmds]
+
           break unless cmds
         ensure
           set_mode :running
@@ -856,6 +870,7 @@ module DEBUGGER__
             frame = @target_frames.first
             path = frame.location.absolute_path || "!eval:#{frame.path}"
             line = frame.location.lineno
+            label = frame.location.base_label
 
             if frame.iseq
               frame.iseq.traceable_lines_norec(lines = {})
@@ -867,27 +882,80 @@ module DEBUGGER__
 
             depth = @target_frames.first.frame_depth
 
-            step_tp iter do
+            step_tp iter do |tp|
               loc = caller_locations(2, 1).first
               loc_path = loc.absolute_path || "!eval:#{loc.path}"
+              loc_label = loc.base_label
+              loc_depth = DEBUGGER__.frame_depth - 3
 
-              # same stack depth
-              (DEBUGGER__.frame_depth - 3 <= depth) ||
-
-              # different frame
-              (next_line && loc_path == path &&
-               (loc_lineno = loc.lineno) > line &&
-               loc_lineno <= next_line)
+              case
+              when loc_depth == depth && loc_label == label
+                true
+              when loc_depth < depth
+                # lower stack depth
+                true
+              when (next_line &&
+                    loc_path == path &&
+                    (loc_lineno = loc.lineno) > line &&
+                    loc_lineno <= next_line)
+                # different frame (maybe block) but the line is before next_line
+                true
+              end
             end
             break
 
           when :finish
             finish_frames = (iter || 1) - 1
-            goal_depth = @target_frames.first.frame_depth - finish_frames
+            frame = @target_frames.first
+            goal_depth = frame.frame_depth - finish_frames - (frame.has_return_value ? 1 : 0)
 
             step_tp nil, [:return, :b_return] do
               DEBUGGER__.frame_depth - 3 <= goal_depth ? true : false
             end
+            break
+
+          when :until
+            location = iter&.strip
+            frame = @target_frames.first
+            depth = frame.frame_depth - (frame.has_return_value ? 1 : 0)
+            target_location_label = frame.location.base_label
+
+            case location
+            when nil, /\A(?:(.+):)?(\d+)\z/
+              no_loc = !location
+              file = $1 || frame.location.path
+              line = ($2 ||  frame.location.lineno + 1).to_i
+
+              step_tp nil, [:line, :return] do |tp|
+                if tp.event == :line
+                  next false if no_loc && depth < DEBUGGER__.frame_depth - 3
+                  next false unless tp.path.end_with?(file)
+                  next false unless tp.lineno >= line
+                  true
+                else
+                  true if depth >= DEBUGGER__.frame_depth - 3 &&
+                          caller_locations(2, 1).first.label == target_location_label
+                          # TODO: imcomplete condition
+                end
+              end
+            else
+              pat = location
+              if /\A\/(.+)\/\z/ =~ pat
+                pat = Regexp.new($1)
+              end
+
+              step_tp nil, [:call, :c_call, :return] do |tp|
+                case tp.event
+                when :call, :c_call
+                  true if pat === tp.callee_id.to_s
+                else # :return, :b_return
+                  true if depth >= DEBUGGER__.frame_depth - 3 &&
+                          caller_locations(2, 1).first.label == target_location_label
+                          # TODO: imcomplete condition
+                end
+              end
+            end
+
             break
 
           when :back
@@ -934,8 +1002,9 @@ module DEBUGGER__
           when :call
             result = frame_eval(eval_src)
           when :irb
+            require 'irb' # prelude's binding.irb doesn't have show_code option
             begin
-              result = frame_eval('binding.irb')
+              result = frame_eval('binding.irb(show_code: false)', binding_location: true)
             ensure
               # workaround: https://github.com/ruby/debug/issues/308
               Reline.prompt_proc = nil if defined? Reline
@@ -1109,6 +1178,8 @@ module DEBUGGER__
           end
           event! :result, nil
 
+        when :quit
+          sleep # wait for SystemExit
         when :dap
           process_dap args
         when :cdp
@@ -1123,6 +1194,8 @@ module DEBUGGER__
     rescue Exception => e
       pp ["DEBUGGER Exception: #{__FILE__}:#{__LINE__}", e, e.backtrace]
       raise
+    ensure
+      @returning = false
     end
 
     def debug_event(ev, args)

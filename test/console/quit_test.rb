@@ -23,7 +23,7 @@ module DEBUGGER__
         type 'q'
         assert_line_text(/Really quit\? \[Y\/n\]/)
         type 'n'
-        type 'q!'
+        type 'kill!'
       end
     end
 

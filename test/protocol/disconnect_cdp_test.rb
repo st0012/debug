@@ -1,11 +1,9 @@
 # frozen_string_literal: true
 
-__END__
-
 require_relative '../support/protocol_test_case'
 
 module DEBUGGER__
-  class DetachTest < ProtocolTestCase
+  class DisconnectCDPTest < ProtocolTestCase
     PROGRAM = <<~RUBY
        1| module Foo
        2|   class Bar
@@ -21,9 +19,10 @@ module DEBUGGER__
       12| end
     RUBY
 
-    def test_detach_reattach_to_rdbg
-      run_protocol_scenario PROGRAM do
-        assert_reattach
+    def test_closing_cdp_connection_doesnt_kill_the_debuggee
+      run_protocol_scenario PROGRAM, dap: false do
+        req_cdp_disconnect
+        attach_to_cdp_server
         req_terminate_debuggee
       end
     end
