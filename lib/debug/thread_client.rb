@@ -1176,6 +1176,12 @@ module DEBUGGER__
               opt = args.shift
               obj_inspect = DEBUGGER__.safe_inspect(obj)
 
+              if into = opt.delete(:into)
+                output = File.open(into, 'w')
+              else
+                output = @ui
+              end
+
               width = 50
 
               if obj_inspect.length >= width

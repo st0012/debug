@@ -327,7 +327,14 @@ module DEBUGGER__
           obj_id = ev_args[1]
           obj_inspect = ev_args[2]
           opt = ev_args[3]
-          add_tracer ObjectTracer.new(@ui, obj_id, obj_inspect, **opt)
+
+          if into = opt.delete(:into)
+            output = File.open(into, 'w')
+          else
+            output = @ui
+          end
+
+          add_tracer ObjectTracer.new(obj_id, obj_inspect, output: output, **opt).enable
         else
           # ignore
         end
@@ -950,6 +957,12 @@ module DEBUGGER__
           arg.sub!(re, '')
         end
 
+        if into
+          output = File.open(into, 'w')
+        else
+          output = @ui
+        end
+
         case arg
         when nil
           @ui.puts 'Tracers:'
@@ -960,15 +973,15 @@ module DEBUGGER__
           :retry
 
         when /\Aline\z/
-          add_tracer LineTracer.new(@ui, pattern: pattern, into: into)
+          add_tracer LineTracer.new(output: output, pattern: pattern).enable
           :retry
 
         when /\Acall\z/
-          add_tracer CallTracer.new(@ui, pattern: pattern, into: into)
+          add_tracer CallTracer.new(output: output, pattern: pattern).enable
           :retry
 
         when /\Aexception\z/
-          add_tracer ExceptionTracer.new(@ui, pattern: pattern, into: into)
+          add_tracer ExceptionTracer.new(output: output, pattern: pattern).enable
           :retry
 
         when /\Aobject\s+(.+)/
