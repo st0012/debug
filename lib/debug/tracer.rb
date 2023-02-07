@@ -94,9 +94,7 @@ class BaseTracer
       @pattern = nil
     end
 
-    @tp = setup
-
-    puts "PID:#{Process.pid} #{self}" if @output.is_a?(File)
+    @tp = setup_tp
   end
 
   def key
@@ -108,16 +106,17 @@ class BaseTracer
   end
 
   def to_s
-    s = "#{@name}#{description} (#{@tp.enabled? ? 'enabled' : 'disabled'})"
+    s = "#{@name} #{description}"
     s += " with pattern #{@pattern.inspect}" if @pattern
     s
   end
 
   def description
-    nil
+    "(#{@tp.enabled? ? 'enabled' : 'disabled'})"
   end
 
   def enable
+    puts "PID:#{Process.pid} #{self}" if @output.is_a?(File)
     @tp.enable
     self
   end
@@ -160,7 +159,7 @@ class BaseTracer
 end
 
 class LineTracer < BaseTracer
-  def setup
+  def setup_tp
     TracePoint.new(:line){|tp|
       next if skip?(tp)
       # pp tp.object_id, caller(0)
@@ -170,7 +169,7 @@ class LineTracer < BaseTracer
 end
 
 class CallTracer < BaseTracer
-  def setup
+  def setup_tp
     TracePoint.new(:a_call, :a_return){|tp|
       next if skip?(tp)
 
@@ -205,7 +204,7 @@ class CallTracer < BaseTracer
 end
 
 class ExceptionTracer < BaseTracer
-  def setup
+  def setup_tp
     TracePoint.new(:raise) do |tp|
       next if skip?(tp)
 
@@ -234,14 +233,14 @@ class ObjectTracer < BaseTracer
   end
 
   def description
-    " for #{@obj_inspect}"
+    "for #{@obj_inspect} #{super}"
   end
 
   def colorized_obj_inspect
     colorize_magenta(@obj_inspect)
   end
 
-  def setup
+  def setup_tp
     TracePoint.new(:a_call){|tp|
       next if skip?(tp)
 
@@ -302,18 +301,18 @@ module DEBUGGER__
   module TracerExtension
     include SkipPathHelper
 
+    def initialize(...)
+      super
+      @name = @name.sub(/DEBUGGER__::/, "")
+      @type = @type.sub(/DEBUGGER__::/, "").downcase
+    end
+
     def header
       "DEBUGGER (trace/#{@type}) \#th:#{Thread.current.instance_variable_get(:@__thread_client_id)}"
     end
 
     def skip? tp
       ThreadClient.current.management? || skip_path?(tp.path) || super
-    end
-
-    def setup
-      @name = @name.sub(/DEBUGGER__::/, "")
-      @type = @type.sub(/DEBUGGER__::/, "").downcase
-      super
     end
 
     def to_s
