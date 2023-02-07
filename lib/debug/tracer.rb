@@ -45,15 +45,25 @@ class BaseTracer
     "<#inspect raises #{e.inspect}>"
   end
 
-  include DEBUGGER__::Color
-
   def colorize(str, color)
     # don't colorize trace sent into a file
-    if @into
+    if @output.is_a?(File)
       str
     else
-      super
+      IRB::Color.colorize str, color
     end
+  end
+
+  def colorize_cyan(str)
+    colorize(str, [:CYAN, :BOLD])
+  end
+
+  def colorize_blue(str)
+    colorize(str, [:BLUE, :BOLD])
+  end
+
+  def colorize_magenta(str)
+    colorize(str, [:MAGENTA, :BOLD])
   end
 
   def pretty_path path
@@ -310,6 +320,14 @@ module DEBUGGER__
       s = super
       s += " into: #{File.basename(@output)}" if @output.is_a?(File)
       s
+    end
+
+    def colorize str, color
+      if !CONFIG[:no_color]
+        super str, color
+      else
+        str
+      end
     end
   end
 
