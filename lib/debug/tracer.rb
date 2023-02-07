@@ -2,6 +2,7 @@
 
 class BaseTracer
   M_OBJECT_ID = method(:object_id).unbind
+  HOME = ENV['HOME'] ? (ENV['HOME'] + '/') : nil
 
   include DEBUGGER__::Color
 
@@ -11,6 +12,23 @@ class BaseTracer
       str
     else
       super
+    end
+  end
+
+  def pretty_path path
+    return '#<none>' unless path
+
+    case
+    when path.start_with?(dir = RbConfig::CONFIG["rubylibdir"] + '/')
+      path.sub(dir, '$(rubylibdir)/')
+    when Gem.path.any? do |gp|
+        path.start_with?(dir = gp + '/gems/')
+      end
+      path.sub(dir, '$(Gem)/')
+    when HOME && path.start_with?(HOME)
+      path.sub(HOME, '~/')
+    else
+      path
     end
   end
 
@@ -66,7 +84,7 @@ class BaseTracer
   end
 
   def out tp, msg = nil, depth = caller.size - 1
-    location_str = colorize("#{DEBUGGER__::FrameInfo.pretty_path(tp.path)}:#{tp.lineno}", [:GREEN])
+    location_str = colorize("#{pretty_path(tp.path)}:#{tp.lineno}", [:GREEN])
     buff = "#{header} \#depth:#{'%-2d'%depth}#{msg} at #{location_str}"
 
     puts buff
@@ -92,7 +110,7 @@ end
 
 class LineTracer < BaseTracer
   def setup
-    @tracer = TracePoint.new(:line){|tp|
+    TracePoint.new(:line){|tp|
       next if skip?(tp)
       # pp tp.object_id, caller(0)
       out tp
@@ -102,7 +120,7 @@ end
 
 class CallTracer < BaseTracer
   def setup
-    @tracer = TracePoint.new(:a_call, :a_return){|tp|
+    TracePoint.new(:a_call, :a_return){|tp|
       next if skip?(tp)
 
       depth = caller.size
@@ -137,7 +155,7 @@ end
 
 class ExceptionTracer < BaseTracer
   def setup
-    @tracer = TracePoint.new(:raise) do |tp|
+    TracePoint.new(:raise) do |tp|
       next if skip?(tp)
 
       exc = tp.raised_exception
@@ -173,7 +191,7 @@ class ObjectTracer < BaseTracer
   end
 
   def setup
-    @tracer = TracePoint.new(:a_call){|tp|
+    TracePoint.new(:a_call){|tp|
       next if skip?(tp)
 
       if M_OBJECT_ID.bind_call(tp.self) == @obj_id
