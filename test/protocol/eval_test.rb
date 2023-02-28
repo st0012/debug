@@ -23,5 +23,15 @@ module DEBUGGER__
         req_terminate_debuggee
       end
     end
+
+    def test_eval_workaround
+      run_protocol_scenario PROGRAM do
+        req_add_breakpoint 5
+        assert_repl_result({value: '', type: 'String'}, ',eval 1+1')
+        req_continue
+        assert_line_num 5
+        req_terminate_debuggee
+      end
+    end
   end
 end
