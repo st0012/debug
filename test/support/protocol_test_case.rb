@@ -52,6 +52,10 @@ module DEBUGGER__
     def attach_to_dap_server
       @sock = Socket.unix @remote_info.sock_path
       @seq = 1
+      # Drop any messages buffered from a previous attach (e.g. before a
+      # `disconnect`) so they don't get matched against the new session.
+      @queue.clear
+      @res_backlog.clear
       @reader_thread = Thread.new do
         while res = recv_response
           @queue.push res
@@ -700,6 +704,13 @@ module DEBUGGER__
     end
 
     def find_response key, target, direction
+      # Check the buffer first: a previous `find_response` call may have read
+      # messages out of order (e.g. a `stopped` event arriving before its
+      # triggering request's response) and stashed them here.
+      if (idx = @res_backlog.find_index { |res| res[key] == target })
+        return @res_backlog.delete_at(idx)
+      end
+
       Timeout.timeout(TIMEOUT_SEC) do
         loop do
           res = @queue.pop
@@ -707,6 +718,8 @@ module DEBUGGER__
           @backlog << "#{direction} #{str}"
           if res[key] == target
             return res
+          else
+            @res_backlog << res
           end
         end
       end
